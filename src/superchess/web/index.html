@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Superchess · Neural Analysis</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- ===================== Top bar ===================== -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">♞</div>
+      <div class="brand-text">
+        <h1>Superchess</h1>
+        <span class="tagline">Neural Analysis Board</span>
+      </div>
+    </div>
+
+    <div class="mode-switch" id="modeSwitch">
+      <button data-mode="analysis" class="active">Analysis</button>
+      <button data-mode="play">Play</button>
+    </div>
+
+    <div class="topbar-right">
+      <div class="opening" id="openingName"></div>
+      <div class="engine-info" id="engineInfo">Loading engine…</div>
+    </div>
+  </header>
+
+  <!-- ===================== Main grid ===================== -->
+  <div class="layout">
+    <!-- Eval bar -->
+    <div class="evalbar" id="evalBar" title="White win advantage">
+      <div class="evalbar-fill" id="evalBarFill"></div>
+      <span class="evalbar-label top" id="evalBarLabelTop"></span>
+      <span class="evalbar-label bottom" id="evalBarLabelBottom"></span>
+    </div>
+
+    <!-- Board -->
+    <main class="board-stage">
+      <div class="rank-labels" id="rankLabels"></div>
+      <div class="board-wrap">
+        <div class="board" id="board"></div>
+        <svg class="arrows" id="arrows" viewBox="0 0 8 8" preserveAspectRatio="none"></svg>
+        <div class="board-overlay" id="boardOverlay" hidden>
+          <div class="overlay-card">
+            <h2 id="overlayTitle">Checkmate</h2>
+            <p id="overlaySub">White wins</p>
+            <button class="btn btn-primary" id="overlayNew">New game</button>
+          </div>
+        </div>
+      </div>
+      <div class="file-labels" id="fileLabels"></div>
+
+      <!-- Navigation strip -->
+      <div class="navbar">
+        <button class="nav-btn" id="navStart" title="Start (Home)">⏮</button>
+        <button class="nav-btn" id="navPrev" title="Previous (←)">◀</button>
+        <button class="nav-btn" id="navNext" title="Next (→)">▶</button>
+        <button class="nav-btn" id="navEnd" title="Latest (End)">⏭</button>
+        <span class="nav-sep"></span>
+        <button class="nav-btn" id="flipBtn" title="Flip board (F)">⟲ Flip</button>
+        <button class="nav-btn" id="undoBtn" title="Undo move">Undo</button>
+      </div>
+    </main>
+
+    <!-- Right panel -->
+    <aside class="side">
+      <!-- Engine analysis -->
+      <section class="card engine-card">
+        <div class="card-head">
+          <h3>Engine</h3>
+          <label class="switch" title="Toggle live analysis">
+            <input type="checkbox" id="analyzeToggle" checked />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="engine-stats" id="engineStats">
+          <span><b id="statDepth">—</b><small>depth</small></span>
+          <span><b id="statNodes">—</b><small>nodes</small></span>
+          <span><b id="statNps">—</b><small>nps</small></span>
+          <span><b id="statTime">—</b><small>time</small></span>
+        </div>
+        <ol class="lines" id="engineLines">
+          <li class="lines-empty">Turn on analysis to see engine lines.</li>
+        </ol>
+      </section>
+
+      <!-- Eval graph -->
+      <section class="card graph-card">
+        <div class="card-head"><h3>Evaluation graph</h3></div>
+        <svg class="evalgraph" id="evalGraph" viewBox="0 0 300 90" preserveAspectRatio="none">
+          <line class="graph-mid" x1="0" y1="45" x2="300" y2="45" />
+          <polyline class="graph-area" id="graphArea" points="" />
+          <polyline class="graph-line" id="graphLine" points="" />
+          <line class="graph-cursor" id="graphCursor" x1="0" y1="0" x2="0" y2="90" />
+        </svg>
+      </section>
+
+      <!-- Moves -->
+      <section class="card moves-card">
+        <div class="card-head">
+          <h3>Moves</h3>
+          <span class="material-badge" id="materialBadge"></span>
+        </div>
+        <div class="move-list" id="moveList"></div>
+        <div class="captured">
+          <div class="captured-row">
+            <span id="capturedByWhite" class="captured-pieces"></span>
+            <span class="material" id="matWhite"></span>
+          </div>
+          <div class="captured-row">
+            <span id="capturedByBlack" class="captured-pieces"></span>
+            <span class="material" id="matBlack"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Controls -->
+      <section class="card controls-card">
+        <div class="card-head"><h3>Settings</h3></div>
+
+        <div class="control-group" id="playAsGroup">
+          <label>Play as</label>
+          <div class="segmented" id="sideSelect">
+            <button data-side="white" class="active">White</button>
+            <button data-side="black">Black</button>
+            <button data-side="both">Both</button>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <label>Strength <span id="simValue" class="hint">256 sims</span></label>
+          <input type="range" id="simSlider" min="16" max="1600" step="16" value="256" />
+        </div>
+
+        <div class="control-group">
+          <label>Engine lines <span id="mpvValue" class="hint">3 lines</span></label>
+          <input type="range" id="mpvSlider" min="1" max="6" step="1" value="3" />
+        </div>
+
+        <div class="control-group">
+          <label>Exploration <span id="tempValue" class="hint">0.00</span></label>
+          <input type="range" id="tempSlider" min="0" max="100" step="5" value="0" />
+        </div>
+
+        <div class="control-group">
+          <label>Board theme</label>
+          <div class="theme-row" id="themeRow">
+            <button data-theme="blue" class="theme-chip active" style="--c:#6f86b6"></button>
+            <button data-theme="green" class="theme-chip" style="--c:#769656"></button>
+            <button data-theme="brown" class="theme-chip" style="--c:#b58863"></button>
+            <button data-theme="slate" class="theme-chip" style="--c:#5a6b80"></button>
+            <button data-theme="purple" class="theme-chip" style="--c:#8476c4"></button>
+          </div>
+        </div>
+
+        <div class="control-group toggles">
+          <label class="check"><input type="checkbox" id="coordToggle" checked /> Coordinates</label>
+          <label class="check"><input type="checkbox" id="arrowToggle" checked /> Engine arrows</label>
+        </div>
+      </section>
+
+      <!-- Position tools -->
+      <section class="card tools-card">
+        <div class="card-head"><h3>Position</h3></div>
+        <div class="button-row">
+          <button class="btn btn-primary" id="newBtn">New game</button>
+          <button class="btn" id="hintBtn">Hint</button>
+        </div>
+        <div class="button-row">
+          <button class="btn" id="importBtn">Load FEN / PGN</button>
+          <button class="btn" id="copyFenBtn">Copy FEN</button>
+        </div>
+        <div class="button-row">
+          <button class="btn" id="copyPgnBtn">Copy PGN</button>
+          <button class="btn" id="analyzeNowBtn">Analyze now</button>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- Import modal -->
+  <div class="modal" id="importModal" hidden>
+    <div class="modal-card">
+      <h2>Load position</h2>
+      <p>Paste a FEN string or a full PGN game.</p>
+      <textarea id="importText" rows="7" placeholder="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+or
+1. e4 e5 2. Nf3 Nc6 ..."></textarea>
+      <div class="button-row">
+        <button class="btn btn-primary" id="importApply">Load</button>
+        <button class="btn" id="importCancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

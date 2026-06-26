@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superchess"
+version = "0.1.0"
+description = "Supervised CNN+Transformer chess engine training pipeline with neural MCTS."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "numpy>=1.26",
+    "python-chess>=1.999",
+    "pyyaml>=6.0",
+    "requests>=2.32",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2"]
+extract = ["py7zr>=0.21"]
+evals = ["zstandard>=0.22"]
+torch = ["torch>=2.3"]
+
+[project.scripts]
+superchess = "superchess.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+superchess = ["web/*.html", "web/*.css", "web/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
