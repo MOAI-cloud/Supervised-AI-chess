@@ -1,0 +1,16 @@
+{
+  "history": [
+    {
+      "loss": 2.6200671468403924,
+      "policy_loss": 1.800462719852728,
+      "value_loss": 0.8196044269293874,
+      "policy_accuracy_top1": 0.4908573183132096,
+      "policy_accuracy_top5": 0.8905771041851385,
+      "val_loss": 2.5557678916352997,
+      "val_policy_loss": 1.7377252910498877,
+      "val_value_loss": 0.8180426003856127,
+      "val_policy_accuracy_top1": 0.5135706601258381,
+      "val_policy_accuracy_top5": 0.9061295664434202
+    }
+  ]
+}
