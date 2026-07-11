@@ -73,7 +73,10 @@ move whenever it is its turn. Engine strength, PV length, exploration, arrows,
 flipping, undo, and hints remain configurable. The backend uses only the standard
 library plus python-chess, so no extra dependencies are required.
 
-![Superchess arena with Superchess as White](chess.gif)
+<p align="center">
+	<img src="chess.gif" alt="Superchess arena with Superchess as White" width="48%" />
+	<img src="chess2.gif" alt="Superchess arena with Superchess as Black" width="48%" />
+</p>
 
 Select **Arena** to run an automatic **Superchess vs Stockfish** match. Choose
 which color Superchess plays and a Lichess Stockfish level from 1 through 8,
@@ -110,8 +113,6 @@ Cburnett SVG pieces, orientation, coordinates, check marker, and last-move
 highlighting as the browser GUI. They also include player names, the stable
 opening name, and the Superchess evaluation gauge. Rendering never reruns either
 engine. A saved replay can also be rendered later from the command line:
-
-![Superchess arena with Superchess as Black](chess2.gif)
 
 ```bash
 superchess gif --replay game.replay.json --out game.gif
