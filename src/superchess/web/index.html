@@ -3,46 +3,62 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Superchess · Neural Analysis</title>
+  <meta name="theme-color" content="#161512" />
+  <title>Superchess · Analysis board</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
-<body>
-  <!-- ===================== Top bar ===================== -->
+<body data-theme="brown">
   <header class="topbar">
-    <div class="brand">
-      <div class="brand-mark">♞</div>
-      <div class="brand-text">
-        <h1>Superchess</h1>
-        <span class="tagline">Neural Analysis Board</span>
-      </div>
-    </div>
+    <a class="brand" href="/" aria-label="Superchess home">
+      <span class="brand-mark" aria-hidden="true">♞</span>
+      <span class="brand-name">superchess</span>
+    </a>
 
-    <div class="mode-switch" id="modeSwitch">
+    <nav class="mode-switch" id="modeSwitch" aria-label="Board mode">
       <button data-mode="analysis" class="active">Analysis</button>
       <button data-mode="play">Play</button>
-    </div>
+      <button data-mode="arena">Arena</button>
+    </nav>
 
     <div class="topbar-right">
-      <div class="opening" id="openingName"></div>
-      <div class="engine-info" id="engineInfo">Loading engine…</div>
+      <span class="top-status" id="topStatus">Neural analysis board</span>
+      <button class="icon-btn" id="preferencesBtn" title="Analysis settings" aria-label="Analysis settings">⚙</button>
     </div>
   </header>
 
-  <!-- ===================== Main grid ===================== -->
   <div class="layout">
-    <!-- Eval bar -->
-    <div class="evalbar" id="evalBar" title="White win advantage">
-      <div class="evalbar-fill" id="evalBarFill"></div>
-      <span class="evalbar-label top" id="evalBarLabelTop"></span>
-      <span class="evalbar-label bottom" id="evalBarLabelBottom"></span>
-    </div>
+    <aside class="left-rail">
+      <div class="variant-card">
+        <span class="variant-icon" aria-hidden="true">♛</span>
+        <span>
+          <strong>Standard</strong>
+          <small>Neural MCTS analysis</small>
+        </span>
+        <span class="variant-chevron" aria-hidden="true">▾</span>
+      </div>
 
-    <!-- Board -->
+      <div class="opening-panel">
+        <small>Opening</small>
+        <strong class="opening" id="openingName">Starting position</strong>
+      </div>
+
+      <div class="rail-spacer"></div>
+
+      <div class="shortcut-card">
+        <small>Board controls</small>
+        <div><kbd>←</kbd><kbd>→</kbd><span>Move through game</span></div>
+        <div><kbd>F</kbd><span>Flip board</span></div>
+      </div>
+      <div class="engine-info" id="engineInfo">Loading engine…</div>
+    </aside>
+
     <main class="board-stage">
-      <div class="rank-labels" id="rankLabels"></div>
       <div class="board-wrap">
-        <div class="board" id="board"></div>
-        <svg class="arrows" id="arrows" viewBox="0 0 8 8" preserveAspectRatio="none"></svg>
+        <div class="board" id="board" aria-label="Chess board"></div>
+        <svg class="arrows" id="arrows" viewBox="0 0 8 8" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="rank-labels" id="rankLabels" aria-hidden="true"></div>
+        <div class="file-labels" id="fileLabels" aria-hidden="true"></div>
+        <div class="promotion-chooser" id="promotionChooser" hidden></div>
         <div class="board-overlay" id="boardOverlay" hidden>
           <div class="overlay-card">
             <h2 id="overlayTitle">Checkmate</h2>
@@ -51,152 +67,234 @@
           </div>
         </div>
       </div>
-      <div class="file-labels" id="fileLabels"></div>
-
-      <!-- Navigation strip -->
-      <div class="navbar">
-        <button class="nav-btn" id="navStart" title="Start (Home)">⏮</button>
-        <button class="nav-btn" id="navPrev" title="Previous (←)">◀</button>
-        <button class="nav-btn" id="navNext" title="Next (→)">▶</button>
-        <button class="nav-btn" id="navEnd" title="Latest (End)">⏭</button>
-        <span class="nav-sep"></span>
-        <button class="nav-btn" id="flipBtn" title="Flip board (F)">⟲ Flip</button>
-        <button class="nav-btn" id="undoBtn" title="Undo move">Undo</button>
-      </div>
     </main>
 
-    <!-- Right panel -->
+    <div class="evalbar" id="evalBar" title="White advantage">
+      <div class="evalbar-fill" id="evalBarFill"></div>
+      <span class="evalbar-label top" id="evalBarLabelTop"></span>
+      <span class="evalbar-label bottom" id="evalBarLabelBottom">0.00</span>
+    </div>
+
     <aside class="side">
-      <!-- Engine analysis -->
-      <section class="card engine-card">
-        <div class="card-head">
-          <h3>Engine</h3>
-          <label class="switch" title="Toggle live analysis">
-            <input type="checkbox" id="analyzeToggle" checked />
-            <span class="slider"></span>
-          </label>
-        </div>
-        <div class="engine-stats" id="engineStats">
-          <span><b id="statDepth">—</b><small>depth</small></span>
-          <span><b id="statNodes">—</b><small>nodes</small></span>
-          <span><b id="statNps">—</b><small>nps</small></span>
-          <span><b id="statTime">—</b><small>time</small></span>
-        </div>
-        <ol class="lines" id="engineLines">
-          <li class="lines-empty">Turn on analysis to see engine lines.</li>
-        </ol>
-      </section>
-
-      <!-- Eval graph -->
-      <section class="card graph-card">
-        <div class="card-head"><h3>Evaluation graph</h3></div>
-        <svg class="evalgraph" id="evalGraph" viewBox="0 0 300 90" preserveAspectRatio="none">
-          <line class="graph-mid" x1="0" y1="45" x2="300" y2="45" />
-          <polyline class="graph-area" id="graphArea" points="" />
-          <polyline class="graph-line" id="graphLine" points="" />
-          <line class="graph-cursor" id="graphCursor" x1="0" y1="0" x2="0" y2="90" />
-        </svg>
-      </section>
-
-      <!-- Moves -->
-      <section class="card moves-card">
-        <div class="card-head">
-          <h3>Moves</h3>
-          <span class="material-badge" id="materialBadge"></span>
-        </div>
-        <div class="move-list" id="moveList"></div>
-        <div class="captured">
-          <div class="captured-row">
-            <span id="capturedByWhite" class="captured-pieces"></span>
-            <span class="material" id="matWhite"></span>
+      <div class="analysis-shell">
+        <section class="card engine-card">
+          <div class="engine-head">
+            <label class="engine-toggle" title="Toggle live analysis">
+              <input type="checkbox" id="analyzeToggle" checked />
+              <span aria-hidden="true">✓</span>
+            </label>
+            <strong class="engine-score" id="engineScore">0.00</strong>
+            <div class="engine-name">
+              <strong id="activeEngineName">SUPERCHESS NN</strong>
+              <small id="activeEngineDetail">local neural engine</small>
+            </div>
+            <button class="panel-icon" id="panelSettingsBtn" title="Engine settings" aria-label="Engine settings">⚙</button>
           </div>
-          <div class="captured-row">
-            <span id="capturedByBlack" class="captured-pieces"></span>
-            <span class="material" id="matBlack"></span>
+
+          <div class="engine-stats" id="engineStats">
+            <span title="Deepest visited MCTS path"><small>Depth</small><b id="statDepth">—</b></span>
+            <span><small>Nodes</small><b id="statNodes">—</b></span>
+            <span><small>NPS</small><b id="statNps">—</b></span>
+            <span><small>Time</small><b id="statTime">—</b></span>
           </div>
-        </div>
-      </section>
 
-      <!-- Controls -->
-      <section class="card controls-card">
-        <div class="card-head"><h3>Settings</h3></div>
+          <ol class="lines" id="engineLines">
+            <li class="lines-empty">Waiting for the engine…</li>
+          </ol>
+        </section>
 
-        <div class="control-group" id="playAsGroup">
-          <label>Play as</label>
-          <div class="segmented" id="sideSelect">
-            <button data-side="white" class="active">White</button>
-            <button data-side="black">Black</button>
-            <button data-side="both">Both</button>
+        <section class="card play-setup" id="playAsGroup" hidden>
+          <div class="card-head">
+            <h3>Play against Superchess</h3>
+            <span id="playSideHint">You play White</span>
           </div>
-        </div>
-
-        <div class="control-group">
-          <label>Strength <span id="simValue" class="hint">256 sims</span></label>
-          <input type="range" id="simSlider" min="16" max="1600" step="16" value="256" />
-        </div>
-
-        <div class="control-group">
-          <label>Engine lines <span id="mpvValue" class="hint">3 lines</span></label>
-          <input type="range" id="mpvSlider" min="1" max="6" step="1" value="3" />
-        </div>
-
-        <div class="control-group">
-          <label>Exploration <span id="tempValue" class="hint">0.00</span></label>
-          <input type="range" id="tempSlider" min="0" max="100" step="5" value="0" />
-        </div>
-
-        <div class="control-group">
-          <label>Board theme</label>
-          <div class="theme-row" id="themeRow">
-            <button data-theme="blue" class="theme-chip active" style="--c:#6f86b6"></button>
-            <button data-theme="green" class="theme-chip" style="--c:#769656"></button>
-            <button data-theme="brown" class="theme-chip" style="--c:#b58863"></button>
-            <button data-theme="slate" class="theme-chip" style="--c:#5a6b80"></button>
-            <button data-theme="purple" class="theme-chip" style="--c:#8476c4"></button>
+          <div class="side-picker" id="sideSelect" role="group" aria-label="Choose which side to play">
+            <button data-side="white" class="active" aria-pressed="true">
+              <span class="side-piece" aria-hidden="true">♔</span>
+              <span>White</span>
+            </button>
+            <button data-side="black" aria-pressed="false">
+              <span class="side-piece dark" aria-hidden="true">♚</span>
+              <span>Black</span>
+            </button>
+            <button data-side="both" aria-pressed="false">
+              <span class="side-piece both" aria-hidden="true">↔</span>
+              <span>Both</span>
+            </button>
           </div>
-        </div>
+        </section>
 
-        <div class="control-group toggles">
-          <label class="check"><input type="checkbox" id="coordToggle" checked /> Coordinates</label>
-          <label class="check"><input type="checkbox" id="arrowToggle" checked /> Engine arrows</label>
-        </div>
-      </section>
+        <section class="card arena-setup" id="arenaSetup" hidden>
+          <div class="card-head">
+            <h3>Engine arena</h3>
+            <span id="arenaStatus">Ready</span>
+          </div>
 
-      <!-- Position tools -->
-      <section class="card tools-card">
-        <div class="card-head"><h3>Position</h3></div>
-        <div class="button-row">
-          <button class="btn btn-primary" id="newBtn">New game</button>
-          <button class="btn" id="hintBtn">Hint</button>
-        </div>
-        <div class="button-row">
-          <button class="btn" id="importBtn">Load FEN / PGN</button>
-          <button class="btn" id="copyFenBtn">Copy FEN</button>
-        </div>
-        <div class="button-row">
-          <button class="btn" id="copyPgnBtn">Copy PGN</button>
-          <button class="btn" id="analyzeNowBtn">Analyze now</button>
-        </div>
-      </section>
+          <div class="arena-matchup" aria-label="Arena players">
+            <span><b>SUPERCHESS</b><small id="arenaSuperchessColor">White</small></span>
+            <strong>VS</strong>
+            <span><b>STOCKFISH</b><small id="arenaStockfishLabel">Level 4 · Black</small></span>
+          </div>
+
+          <div class="arena-control">
+            <label>Stockfish Lichess level <span id="arenaLevelHint">4</span></label>
+            <div class="level-picker" id="arenaLevelSelect" role="group" aria-label="Choose Lichess Stockfish level">
+              <button data-level="1">1</button>
+              <button data-level="2">2</button>
+              <button data-level="3">3</button>
+              <button data-level="4" class="active">4</button>
+              <button data-level="5">5</button>
+              <button data-level="6">6</button>
+              <button data-level="7">7</button>
+              <button data-level="8">8</button>
+            </div>
+            <p class="preset-detail" id="arenaPresetDetail">Skill 3 · 200 ms · depth 5</p>
+          </div>
+
+          <div class="arena-control">
+            <label>Superchess color</label>
+            <div class="segmented" id="arenaColorSelect" role="group" aria-label="Choose Superchess color">
+              <button data-color="white" class="active">White</button>
+              <button data-color="black">Black</button>
+            </div>
+          </div>
+
+          <div class="arena-actions">
+            <button class="btn btn-primary" id="arenaStartBtn">Start match</button>
+            <button class="btn" id="arenaPauseBtn" disabled>Pause</button>
+          </div>
+          <p class="arena-note" id="stockfishAvailability">Checking local Stockfish…</p>
+        </section>
+
+        <section class="card graph-card">
+          <div class="card-head">
+            <h3>Evaluation graph</h3>
+            <span>White advantage</span>
+          </div>
+          <svg class="evalgraph" id="evalGraph" viewBox="0 0 300 90" preserveAspectRatio="none" aria-label="Evaluation history">
+            <line class="graph-mid" x1="0" y1="45" x2="300" y2="45" />
+            <polyline class="graph-area" id="graphArea" points="" />
+            <polyline class="graph-line" id="graphLine" points="" />
+            <line class="graph-cursor" id="graphCursor" x1="0" y1="0" x2="0" y2="90" />
+          </svg>
+        </section>
+
+        <section class="card moves-card">
+          <div class="card-head">
+            <h3>Moves</h3>
+            <span class="material-badge" id="materialBadge">even</span>
+          </div>
+          <div class="move-list" id="moveList">
+            <div class="move-placeholder">Make a move or load a game to begin.</div>
+          </div>
+          <div class="captured">
+            <div class="captured-row">
+              <span id="capturedByWhite" class="captured-pieces"></span>
+              <span class="material" id="matWhite"></span>
+            </div>
+            <div class="captured-row">
+              <span id="capturedByBlack" class="captured-pieces"></span>
+              <span class="material" id="matBlack"></span>
+            </div>
+          </div>
+        </section>
+
+        <details class="card controls-card" id="settingsPanel">
+          <summary>
+            <span>Engine &amp; board settings</span>
+            <span class="summary-chevron" aria-hidden="true">⌄</span>
+          </summary>
+          <div class="settings-content">
+            <div class="control-group">
+              <label>Strength <span id="simValue" class="hint">256 sims</span></label>
+              <input type="range" id="simSlider" min="16" max="8192" step="16" value="256" />
+            </div>
+
+            <div class="control-group">
+              <label>Engine lines <span id="mpvValue" class="hint">3 lines</span></label>
+              <input type="range" id="mpvSlider" min="1" max="6" step="1" value="3" />
+            </div>
+
+            <div class="control-group">
+              <label>PV length <span id="pvValue" class="hint">32 plies</span></label>
+              <input type="range" id="pvSlider" min="8" max="64" step="4" value="32" />
+            </div>
+
+            <div class="control-group">
+              <label>Exploration <span id="tempValue" class="hint">0.00</span></label>
+              <input type="range" id="tempSlider" min="0" max="100" step="5" value="0" />
+            </div>
+
+            <div class="control-group">
+              <label>Board theme</label>
+              <div class="theme-row" id="themeRow">
+                <button data-theme="brown" class="theme-chip active" style="--c:#b58863" title="Brown"></button>
+                <button data-theme="green" class="theme-chip" style="--c:#769656" title="Green"></button>
+                <button data-theme="blue" class="theme-chip" style="--c:#6f86b6" title="Blue"></button>
+                <button data-theme="slate" class="theme-chip" style="--c:#5a6b80" title="Slate"></button>
+                <button data-theme="purple" class="theme-chip" style="--c:#8476c4" title="Purple"></button>
+              </div>
+            </div>
+
+            <div class="control-group toggles">
+              <label class="checkbox-label"><input type="checkbox" id="coordToggle" checked /> Coordinates</label>
+              <label class="checkbox-label"><input type="checkbox" id="arrowToggle" checked /> Engine arrows</label>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <nav class="navbar" aria-label="Move navigation">
+        <button class="nav-btn" id="navStart" title="Start (Home)" aria-label="First move">◀◀</button>
+        <button class="nav-btn" id="navPrev" title="Previous (Left arrow)" aria-label="Previous move">◀</button>
+        <button class="nav-btn" id="navNext" title="Next (Right arrow)" aria-label="Next move">▶</button>
+        <button class="nav-btn" id="navEnd" title="Latest (End)" aria-label="Last move">▶▶</button>
+        <button class="nav-btn" id="flipBtn" title="Flip board (F)" aria-label="Flip board">↻</button>
+        <button class="nav-btn menu-btn" id="undoBtn" title="Undo move">Undo</button>
+      </nav>
     </aside>
+
+    <section class="underboard">
+      <div class="position-actions">
+        <button class="btn btn-primary" id="newBtn">New game</button>
+        <button class="btn" id="hintBtn">Hint</button>
+        <button class="btn" id="importBtn">Load FEN / PGN</button>
+        <button class="btn" id="copyFenBtn">Copy FEN</button>
+        <button class="btn" id="copyPgnBtn">Copy PGN</button>
+        <button class="btn" id="downloadPgnBtn">Download PGN</button>
+        <button class="btn" id="downloadReplayBtn">Download replay</button>
+        <button class="btn" id="downloadGifBtn">Download GIF</button>
+        <button class="btn" id="analyzeNowBtn">Analyze now</button>
+      </div>
+      <label class="notation-row">
+        <span>FEN</span>
+        <input id="fenField" spellcheck="false" aria-label="Current FEN" />
+      </label>
+      <label class="notation-row pgn-row">
+        <span>PGN</span>
+        <textarea id="pgnField" rows="3" spellcheck="false" aria-label="Current PGN"></textarea>
+      </label>
+    </section>
   </div>
 
-  <!-- Import modal -->
   <div class="modal" id="importModal" hidden>
-    <div class="modal-card">
-      <h2>Load position</h2>
-      <p>Paste a FEN string or a full PGN game.</p>
-      <textarea id="importText" rows="7" placeholder="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="importTitle">
+      <button class="modal-close" id="importClose" aria-label="Close">×</button>
+      <h2 id="importTitle">Load a position</h2>
+      <p>Paste a FEN position or a complete PGN game.</p>
+      <textarea id="importText" rows="8" placeholder="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+
 or
-1. e4 e5 2. Nf3 Nc6 ..."></textarea>
+
+1. e4 e5 2. Nf3 Nc6 …"></textarea>
       <div class="button-row">
-        <button class="btn btn-primary" id="importApply">Load</button>
+        <button class="btn btn-primary" id="importApply">Load position</button>
         <button class="btn" id="importCancel">Cancel</button>
       </div>
     </div>
   </div>
 
-  <div class="toast" id="toast" hidden></div>
+  <div class="toast" id="toast" hidden role="status" aria-live="polite"></div>
 
   <script src="/app.js"></script>
 </body>

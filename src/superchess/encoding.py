@@ -5,7 +5,15 @@ from dataclasses import dataclass
 import chess
 import numpy as np
 
+LEGACY_BOARD_CHANNELS = 18
 BOARD_CHANNELS = 20
+BOARD_SQUARES = 8 * 8
+LEGACY_PACKED_BOARD_BITS = LEGACY_BOARD_CHANNELS * BOARD_SQUARES
+LEGACY_PACKED_BOARD_BYTES = LEGACY_PACKED_BOARD_BITS // 8
+PACKED_BOARD_BITS = BOARD_CHANNELS * BOARD_SQUARES
+FULL_BITPACKED_BOARD_BYTES = PACKED_BOARD_BITS // 8
+PACKED_BOARD_AUX_BYTES = BOARD_CHANNELS - LEGACY_BOARD_CHANNELS
+PACKED_BOARD_BYTES = LEGACY_PACKED_BOARD_BYTES + PACKED_BOARD_AUX_BYTES
 POLICY_PLANES = 73
 POLICY_SIZE = 64 * POLICY_PLANES
 
@@ -85,14 +93,29 @@ def encode_board(board: chess.Board) -> np.ndarray:
 
 
 def pack_board(board: chess.Board) -> np.ndarray:
-    binary_planes = encode_board(board)[:18].astype(np.uint8, copy=False)
-    return np.packbits(binary_planes.reshape(-1))
+    planes = encode_board(board)
+    binary = np.packbits(planes[:LEGACY_BOARD_CHANNELS].astype(np.uint8, copy=False).reshape(-1))
+    aux = np.rint(planes[LEGACY_BOARD_CHANNELS:, 0, 0] * 255).clip(0, 255).astype(np.uint8)
+    return np.concatenate([binary, aux])
 
 
 def unpack_board(packed: np.ndarray) -> np.ndarray:
-    flat = np.unpackbits(packed, count=18 * 8 * 8).astype(np.float32, copy=False)
+    packed = np.asarray(packed, dtype=np.uint8).reshape(-1)
+    if packed.size == FULL_BITPACKED_BOARD_BYTES:
+        flat = np.unpackbits(packed, count=PACKED_BOARD_BITS).astype(np.float32, copy=False)
+        return flat.reshape(BOARD_CHANNELS, 8, 8)
+    if packed.size not in (LEGACY_PACKED_BOARD_BYTES, PACKED_BOARD_BYTES):
+        raise ValueError(f"unexpected packed board byte count: {packed.size}")
+
     planes = np.zeros((BOARD_CHANNELS, 8, 8), dtype=np.float32)
-    planes[:18] = flat.reshape(18, 8, 8)
+    binary = np.unpackbits(
+        packed[:LEGACY_PACKED_BOARD_BYTES],
+        count=LEGACY_PACKED_BOARD_BITS,
+    ).astype(np.float32, copy=False)
+    planes[:LEGACY_BOARD_CHANNELS] = binary.reshape(LEGACY_BOARD_CHANNELS, 8, 8)
+    if packed.size == PACKED_BOARD_BYTES:
+        aux = packed[LEGACY_PACKED_BOARD_BYTES:PACKED_BOARD_BYTES].astype(np.float32) / 255.0
+        planes[LEGACY_BOARD_CHANNELS:, :, :] = aux[:, None, None]
     return planes
 
 

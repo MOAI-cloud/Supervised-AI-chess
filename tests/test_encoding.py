@@ -1,7 +1,16 @@
 import chess
 import numpy as np
 
-from superchess.encoding import BOARD_CHANNELS, POLICY_SIZE, encode_board, legal_policy_indices, move_to_policy, pack_board, unpack_board
+from superchess.encoding import (
+    BOARD_CHANNELS,
+    LEGACY_BOARD_CHANNELS,
+    POLICY_SIZE,
+    encode_board,
+    legal_policy_indices,
+    move_to_policy,
+    pack_board,
+    unpack_board,
+)
 
 
 def test_start_position_encoding_shape_and_planes():
@@ -29,8 +38,21 @@ def test_move_policy_is_perspective_invariant_for_pawn_pushes():
 
 
 def test_pack_unpack_preserves_binary_planes():
-    board = chess.Board()
+    board = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 37 42")
     packed = pack_board(board)
     unpacked = unpack_board(packed)
+    encoded = encode_board(board)
     assert unpacked.shape == (BOARD_CHANNELS, 8, 8)
-    np.testing.assert_array_equal(unpacked[:18], encode_board(board)[:18])
+    np.testing.assert_array_equal(unpacked[:18], encoded[:18])
+    np.testing.assert_allclose(unpacked[18:], encoded[18:], atol=1 / 255)
+
+
+def test_unpack_board_zero_pads_legacy_binary_pack():
+    board = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 37 42")
+    encoded = encode_board(board)
+    legacy_pack = np.packbits(encoded[:LEGACY_BOARD_CHANNELS].astype(np.uint8, copy=False).reshape(-1))
+
+    unpacked = unpack_board(legacy_pack)
+
+    np.testing.assert_array_equal(unpacked[:LEGACY_BOARD_CHANNELS], encoded[:LEGACY_BOARD_CHANNELS])
+    assert unpacked[LEGACY_BOARD_CHANNELS:].sum() == 0.0

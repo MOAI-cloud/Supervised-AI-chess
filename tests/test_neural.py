@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import chess
@@ -7,7 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from superchess.encoding import POLICY_PLANES, move_to_policy, pack_board
+from superchess.encoding import BOARD_CHANNELS, POLICY_PLANES, move_to_policy, pack_board
 from superchess.mcts import NeuralMCTS, SearchConfig
 from superchess.model import ChessCNNTransformer, ModelConfig
 from superchess.training import (
@@ -16,6 +17,7 @@ from superchess.training import (
     train_supervised,
     train_distillation,
     evaluate_distillation,
+    load_model_checkpoint,
     _new_policy_accuracy_stats,
     _policy_accuracy_metrics,
     _resolve_device,
@@ -29,7 +31,7 @@ def tiny_config() -> ModelConfig:
 
 def test_model_forward_shapes():
     model = ChessCNNTransformer(tiny_config())
-    outputs = model(torch.zeros(2, 18, 8, 8))
+    outputs = model(torch.zeros(2, BOARD_CHANNELS, 8, 8))
     assert outputs["policy"].shape == (2, 4672)
     assert outputs["value"].shape == (2,)
     assert torch.all(outputs["value"].abs() <= 1.0)
@@ -37,7 +39,7 @@ def test_model_forward_shapes():
 
 def test_model_emits_wdl_logits():
     model = ChessCNNTransformer(tiny_config())
-    outputs = model(torch.zeros(2, 18, 8, 8))
+    outputs = model(torch.zeros(2, BOARD_CHANNELS, 8, 8))
     assert outputs["wdl"].shape == (2, 3)
     probs = torch.softmax(outputs["wdl"], dim=1)
     expected_value = probs[:, 0] - probs[:, 2]
@@ -77,7 +79,7 @@ def test_shard_dataset_unpacks_packed_boards(tmp_path: Path):
     )
     dataset = NPZShardDataset(tmp_path)
     planes, policy, value, ply = dataset[0]
-    assert planes.shape == (18, 8, 8)
+    assert planes.shape == (BOARD_CHANNELS, 8, 8)
     assert planes.dtype == torch.float32
     assert int(policy) == move_to_policy(board, chess.Move.from_uci("e2e4")).index
     assert float(value) == 1.0
@@ -174,6 +176,30 @@ def test_train_supervised_reports_held_out_validation_metrics(tmp_path: Path):
     assert checkpoint_metadata["history"][0]["val_loss"] == history[0]["val_loss"]
     saved_checkpoint = torch.load(checkpoint_path, map_location="cpu")
     assert saved_checkpoint["policy_square_order"] == "python-chess"
+    assert saved_checkpoint["data_format"] == "games"
+
+
+def test_train_supervised_errors_when_no_batches_are_processed(tmp_path: Path):
+    board = chess.Board()
+    np.savez(
+        tmp_path / "shard-00000.npz",
+        boards=np.empty((0, pack_board(board).shape[0]), dtype=np.uint8),
+        policies=np.asarray([], dtype=np.uint16),
+        values=np.asarray([], dtype=np.float32),
+        plies=np.asarray([], dtype=np.uint16),
+    )
+
+    with pytest.raises(RuntimeError, match="epoch 1/1 did not process any batches"):
+        train_supervised(
+            tmp_path,
+            tmp_path / "checkpoint.pt",
+            epochs=1,
+            batch_size=2,
+            num_workers=0,
+            device_name="cpu",
+            model_config=tiny_config(),
+            validation_fraction=0.0,
+        )
 
 
 def test_evaluate_supervised_reports_checkpoint_metrics(tmp_path: Path):
@@ -286,6 +312,32 @@ def test_evaluate_distillation_reports_metrics(tmp_path: Path):
     assert "policy_accuracy_top5" in metrics
 
 
+def test_load_model_checkpoint_rejects_legacy_policy_metadata(tmp_path: Path):
+    config = tiny_config()
+    model = ChessCNNTransformer(config)
+    checkpoint_path = tmp_path / "legacy.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "model_config": asdict(config),
+            "policy_size": POLICY_PLANES * 64,
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(RuntimeError, match="policy square-order"):
+        load_model_checkpoint(checkpoint_path, device_name="cpu")
+
+    with pytest.warns(RuntimeWarning, match="policy square-order"):
+        loaded, loaded_config = load_model_checkpoint(
+            checkpoint_path,
+            device_name="cpu",
+            allow_legacy_policy=True,
+        )
+    assert isinstance(loaded, ChessCNNTransformer)
+    assert loaded_config == config
+
+
 def test_resolve_device_falls_back_when_cuda_kernels_are_unusable(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
@@ -303,6 +355,21 @@ def test_resolve_device_falls_back_when_cuda_kernels_are_unusable(monkeypatch):
 def test_mcts_returns_legal_move_from_tiny_model():
     board = chess.Board()
     model = ChessCNNTransformer(tiny_config())
-    result = NeuralMCTS(model, SearchConfig(simulations=2)).search(board)
+    result = NeuralMCTS(model, SearchConfig(simulations=5, evaluation_batch_size=3)).search(board)
     assert result.best_move in board.legal_moves
     assert set(result.visits).issubset(set(board.legal_moves))
+    assert sum(result.visits.values()) == 5
+
+
+def test_mcts_batched_evaluate_returns_each_board():
+    boards = [chess.Board(), chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")]
+    model = ChessCNNTransformer(tiny_config())
+    searcher = NeuralMCTS(model, SearchConfig(simulations=1, evaluation_batch_size=2))
+
+    evaluations = searcher.evaluate_batch(boards)
+
+    assert len(evaluations) == 2
+    for board, (policy, value) in zip(boards, evaluations, strict=True):
+        assert set(policy).issubset(set(board.legal_moves))
+        assert sum(policy.values()) == pytest.approx(1.0)
+        assert -1.0 <= value <= 1.0

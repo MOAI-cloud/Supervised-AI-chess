@@ -1,15 +1,16 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import math
 import torch
 from torch import nn
 from torch.nn import functional as F
-from superchess.encoding import POLICY_PLANES, POLICY_SIZE
+from superchess.encoding import BOARD_CHANNELS, POLICY_PLANES, POLICY_SIZE
 
 NUM_SQUARES = 64
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    input_channels: int = 18
+    input_channels: int = BOARD_CHANNELS
     channels: int = 256
     cnn_blocks: int = 6
     transformer_layers: int = 10
@@ -55,10 +56,9 @@ class SquareAttention(nn.Module):
             raise ValueError("channels must be divisible by attention_heads")
         self.heads = heads
         self.head_dim = dim // heads
-        self.scale = self.head_dim**-0.5
+        self.dropout_p = dropout
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
         self.square_bias = (
             nn.Parameter(torch.zeros(heads, NUM_SQUARES, NUM_SQUARES)) if attention_bias else None
         )
@@ -66,12 +66,18 @@ class SquareAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, tokens, channels = x.shape
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        query, key, value = qkv[0], qkv[1], qkv[2]
-        attention = torch.matmul(query, key.transpose(-2, -1)) * self.scale
+        query, key, value = qkv.unbind(0)
+        bias = None
         if self.square_bias is not None and tokens == NUM_SQUARES:
-            attention = attention + self.square_bias.unsqueeze(0)
-        attention = self.dropout(attention.softmax(dim=-1))
-        out = torch.matmul(attention, value).transpose(1, 2).reshape(batch, tokens, channels)
+            bias = self.square_bias.to(query.dtype).unsqueeze(0)
+        out = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=bias,
+            dropout_p=self.dropout_p if self.training else 0.0,
+        )
+        out = out.transpose(1, 2).reshape(batch, tokens, channels)
         return self.proj(out)
 
 
@@ -141,6 +147,15 @@ class ChessCNNTransformer(nn.Module):
     def reset_parameters(self) -> None:
         nn.init.normal_(self.square_embedding, std=0.02)
         nn.init.zeros_(self.policy_head.bias)
+        # Start every residual branch near identity so deep stacks train stably:
+        # zero the closing BatchNorm gamma of each conv block (He et al., "Bag of
+        # Tricks") and depth-scale the transformer residual projections (GPT-2).
+        for block in self.cnn:
+            nn.init.zeros_(block.net[-1].weight)
+        residual_std = 0.02 / math.sqrt(2 * max(1, self.config.transformer_layers))
+        for layer in self.transformer:
+            nn.init.normal_(layer.attention.proj.weight, std=residual_std)
+            nn.init.normal_(layer.mlp.out_proj.weight, std=residual_std)
 
     def forward(self, boards: torch.Tensor) -> dict[str, torch.Tensor]:
         features = self.cnn(self.stem(boards))

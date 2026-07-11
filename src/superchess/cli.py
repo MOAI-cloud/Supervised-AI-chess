@@ -94,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
     evaluate_parser.add_argument("--device", default=None)
     evaluate_parser.add_argument("--no-amp", action="store_true")
     evaluate_parser.add_argument("--max-steps", type=int, default=None)
+    evaluate_parser.add_argument(
+        "--allow-legacy-checkpoint",
+        action="store_true",
+        help="Load checkpoints missing current compatibility metadata",
+    )
 
     search_parser = subparsers.add_parser("search", help="Run neural MCTS from a checkpoint")
     search_parser.add_argument("--checkpoint", type=Path, required=True)
@@ -101,14 +106,36 @@ def main(argv: list[str] | None = None) -> int:
     search_parser.add_argument("--simulations", type=int, default=128)
     search_parser.add_argument("--c-puct", type=float, default=1.5)
     search_parser.add_argument("--temperature", type=float, default=0.0)
+    search_parser.add_argument("--eval-batch-size", type=int, default=8)
     search_parser.add_argument("--device", default=None)
+    search_parser.add_argument(
+        "--allow-legacy-checkpoint",
+        action="store_true",
+        help="Load checkpoints missing current compatibility metadata",
+    )
 
     gui_parser = subparsers.add_parser("gui", help="Launch the web GUI to play against the engine")
     gui_parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/superchess.pt"))
     gui_parser.add_argument("--host", default="127.0.0.1")
     gui_parser.add_argument("--port", type=int, default=8000)
     gui_parser.add_argument("--device", default=None)
+    gui_parser.add_argument(
+        "--stockfish",
+        default="stockfish",
+        help="Stockfish executable name or path (default: search PATH and /usr/games)",
+    )
     gui_parser.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser tab")
+    gui_parser.add_argument(
+        "--allow-legacy-checkpoint",
+        action="store_true",
+        help="Load checkpoints missing current compatibility metadata",
+    )
+
+    gif_parser = subparsers.add_parser("gif", help="Render a Superchess replay JSON as an animated GIF")
+    gif_parser.add_argument("--replay", type=Path, required=True)
+    gif_parser.add_argument("--out", type=Path, required=True)
+    gif_parser.add_argument("--board-size", type=int, default=560)
+    gif_parser.add_argument("--orientation", choices=["white", "black"], default=None)
 
     args = parser.parse_args(argv)
 
@@ -233,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 device_name=args.device,
                 amp=not args.no_amp,
                 max_steps=args.max_steps,
+                allow_legacy_policy=args.allow_legacy_checkpoint,
             )
         else:
             from superchess.training import evaluate_supervised
@@ -245,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
                 device_name=args.device,
                 amp=not args.no_amp,
                 max_steps=args.max_steps,
+                allow_legacy_policy=args.allow_legacy_checkpoint,
             )
         print(json.dumps(metrics, indent=2))
         return 0
@@ -256,10 +285,19 @@ def main(argv: list[str] | None = None) -> int:
         from superchess.training import load_model_checkpoint
 
         board = chess.Board() if args.fen == "startpos" else chess.Board(args.fen)
-        model, _ = load_model_checkpoint(args.checkpoint, device_name=args.device)
+        model, _ = load_model_checkpoint(
+            args.checkpoint,
+            device_name=args.device,
+            allow_legacy_policy=args.allow_legacy_checkpoint,
+        )
         result = NeuralMCTS(
             model,
-            SearchConfig(simulations=args.simulations, c_puct=args.c_puct, temperature=args.temperature),
+            SearchConfig(
+                simulations=args.simulations,
+                c_puct=args.c_puct,
+                temperature=args.temperature,
+                evaluation_batch_size=args.eval_batch_size,
+            ),
         ).search(board)
         payload = {
             "best_move": result.best_move.uci(),
@@ -278,7 +316,22 @@ def main(argv: list[str] | None = None) -> int:
             port=args.port,
             device=args.device,
             open_browser=not args.no_browser,
+            allow_legacy_checkpoint=args.allow_legacy_checkpoint,
+            stockfish_path=args.stockfish,
         )
+        return 0
+
+    if args.command == "gif":
+        from superchess.gif import render_replay_gif
+
+        payload = json.loads(args.replay.read_text(encoding="utf-8"))
+        payload["board_size"] = args.board_size
+        if args.orientation is not None:
+            payload["orientation"] = args.orientation
+        data = render_replay_gif(payload)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_bytes(data)
+        print(json.dumps({"gif": str(args.out), "bytes": len(data)}, indent=2))
         return 0
 
     parser.error("unknown command")

@@ -15,10 +15,18 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 from tqdm import tqdm
 
-from superchess.encoding import POLICY_SIZE
+from superchess.encoding import (
+    BOARD_CHANNELS,
+    FULL_BITPACKED_BOARD_BYTES,
+    LEGACY_BOARD_CHANNELS,
+    LEGACY_PACKED_BOARD_BITS,
+    LEGACY_PACKED_BOARD_BYTES,
+    PACKED_BOARD_BITS,
+    PACKED_BOARD_BYTES,
+    POLICY_SIZE,
+)
 from superchess.model import ChessCNNTransformer, ModelConfig
 
-PACKED_BOARD_BITS = 18 * 8 * 8
 POLICY_SQUARE_ORDER = "python-chess"
 POLICY_PHASES = (
     ("early", 0, 20),
@@ -62,6 +70,58 @@ def _check_cuda_device(device: torch.device) -> None:
         ) from error
 
 
+def _configure_backend(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
+
+def _amp_dtype(device: torch.device) -> torch.dtype:
+    """Prefer bfloat16 (no gradient scaling, wider dynamic range) when supported."""
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _optimizer_param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
+    """Apply weight decay to matrices only; norms, biases, and positional tables skip it."""
+    decay: list[torch.nn.Parameter] = []
+    no_decay: list[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or name.endswith(("square_embedding", "square_bias")):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+def _total_training_steps(loader: DataLoader, epochs: int, max_steps: int | None) -> int:
+    steps_per_epoch = len(loader)
+    if max_steps is not None:
+        steps_per_epoch = min(steps_per_epoch, max_steps)
+    return max(1, steps_per_epoch * epochs)
+
+
+def _make_lr_scheduler(
+    optimizer: torch.optim.Optimizer, total_steps: int
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Linear warmup then cosine decay to a 5% floor, stepped per optimizer step."""
+    warmup_steps = max(1, min(1000, total_steps // 20))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 class NPZShardDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(self, data_dir: Path) -> None:
         self.shards = sorted(data_dir.glob("shard-*.npz"))
@@ -85,10 +145,9 @@ class NPZShardDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, to
         shard_start = 0 if shard_index == 0 else self.cumulative[shard_index - 1]
         local_index = index - shard_start
         shard = self._load_shard(shard_index)
-        board = np.unpackbits(shard["boards"][local_index], count=PACKED_BOARD_BITS).astype(np.float32, copy=False)
-        board = board.reshape(18, 8, 8)
+        board = _unpack_board_batch(shard["boards"][local_index : local_index + 1]).squeeze(0)
         return (
-            torch.from_numpy(board),
+            board,
             torch.tensor(int(shard["policies"][local_index]), dtype=torch.long),
             torch.tensor(float(shard["values"][local_index]), dtype=torch.float32),
             torch.tensor(int(shard["plies"][local_index]), dtype=torch.long),
@@ -164,8 +223,24 @@ def _batch_from_shard(
 
 
 def _unpack_board_batch(packed_boards: np.ndarray) -> torch.Tensor:
-    boards = np.unpackbits(packed_boards, axis=1, count=PACKED_BOARD_BITS).astype(np.float32, copy=False)
-    return torch.from_numpy(boards.reshape(-1, 18, 8, 8))
+    width = packed_boards.shape[1]
+    if width == FULL_BITPACKED_BOARD_BYTES:
+        boards = np.unpackbits(packed_boards, axis=1, count=PACKED_BOARD_BITS).astype(np.float32, copy=False)
+        return torch.from_numpy(boards.reshape(-1, BOARD_CHANNELS, 8, 8))
+    if width not in (LEGACY_PACKED_BOARD_BYTES, PACKED_BOARD_BYTES):
+        raise ValueError(f"unexpected packed board byte count: {width}")
+
+    boards = np.zeros((packed_boards.shape[0], BOARD_CHANNELS, 8, 8), dtype=np.float32)
+    binary = np.unpackbits(
+        packed_boards[:, :LEGACY_PACKED_BOARD_BYTES],
+        axis=1,
+        count=LEGACY_PACKED_BOARD_BITS,
+    ).astype(np.float32, copy=False)
+    boards[:, :LEGACY_BOARD_CHANNELS] = binary.reshape(-1, LEGACY_BOARD_CHANNELS, 8, 8)
+    if width == PACKED_BOARD_BYTES:
+        aux = packed_boards[:, LEGACY_PACKED_BOARD_BYTES:PACKED_BOARD_BYTES].astype(np.float32) / 255.0
+        boards[:, LEGACY_BOARD_CHANNELS:, :, :] = aux[:, :, None, None]
+    return torch.from_numpy(boards)
 
 
 def _new_policy_accuracy_stats() -> dict[str, int]:
@@ -223,6 +298,11 @@ def _accuracy(correct: int, total: int) -> float:
     return 0.0 if total == 0 else correct / total
 
 
+def _require_steps(steps: int, desc: str) -> None:
+    if steps == 0:
+        raise RuntimeError(f"{desc} did not process any batches")
+
+
 def _split_train_validation_shards(
     data_dir: Path,
     validation_fraction: float,
@@ -272,6 +352,7 @@ def _evaluate_model(
     value_loss: nn.Module,
     use_amp: bool,
     *,
+    amp_dtype: torch.dtype = torch.float16,
     max_steps: int | None = None,
     desc: str = "evaluate",
 ) -> dict[str, float]:
@@ -293,7 +374,7 @@ def _evaluate_model(
             values = values.to(device, non_blocking=True)
             plies = plies.to(device, non_blocking=True)
 
-            with torch.autocast(device_type=device.type, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 outputs = model(boards)
                 loss_policy = policy_loss(outputs["policy"], policies)
                 loss_value = value_loss(outputs["value"], values)
@@ -317,6 +398,8 @@ def _evaluate_model(
 
     if was_training:
         model.train()
+
+    _require_steps(steps, desc)
 
     return {
         "loss": total_loss / steps,
@@ -348,6 +431,7 @@ def train_supervised(
     validation_seed: int = 0,
 ) -> list[dict[str, float]]:
     device = _resolve_device(device_name)
+    _configure_backend(device)
     train_shards, validation_shards = _split_train_validation_shards(data_dir, validation_fraction, validation_seed)
     loader = _make_batch_loader(data_dir, batch_size, train_shards, num_workers, device, shuffle=True)
     validation_loader = (
@@ -362,16 +446,39 @@ def train_supervised(
     if compile_model and hasattr(torch, "compile"):
         model = torch.compile(model)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        _optimizer_param_groups(checkpoint_model, weight_decay),
         lr=learning_rate,
-        weight_decay=weight_decay,
         fused=device.type == "cuda",
     )
+    scheduler = _make_lr_scheduler(optimizer, _total_training_steps(loader, epochs, max_steps))
     policy_loss = nn.CrossEntropyLoss()
     value_loss = nn.MSELoss()
     use_amp = amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = _amp_dtype(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
     history: list[dict[str, float]] = []
+    best_val_loss = math.inf
+    best_path = out_path.with_name(f"{out_path.stem}-best{out_path.suffix}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def save_checkpoint(path: Path) -> None:
+        torch.save(
+            {
+                "model": checkpoint_model.state_dict(),
+                "model_config": asdict(model_config),
+                "policy_size": POLICY_SIZE,
+                "policy_square_order": POLICY_SQUARE_ORDER,
+                "data_format": "games",
+                "history": history,
+                "epochs_completed": len(history),
+                "validation_fraction": validation_fraction,
+                "validation_shards": [shard.name for shard in validation_shards],
+            },
+            path,
+        )
+        path.with_suffix(path.suffix + ".json").write_text(
+            json.dumps({"history": history}, indent=2), encoding="utf-8"
+        )
 
     for epoch in range(epochs):
         model.train()
@@ -390,7 +497,7 @@ def train_supervised(
             plies = plies.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 outputs = model(boards)
                 loss_policy = policy_loss(outputs["policy"], policies)
                 loss_value = value_loss(outputs["value"], values)
@@ -401,6 +508,7 @@ def train_supervised(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
 
             steps += 1
             total_loss += float(loss.detach())
@@ -418,10 +526,12 @@ def train_supervised(
             if max_steps is not None and steps >= max_steps:
                 break
 
+        _require_steps(steps, f"epoch {epoch + 1}/{epochs}")
         epoch_metrics = {
             "loss": total_loss / steps,
             "policy_loss": total_policy / steps,
             "value_loss": total_value / steps,
+            "learning_rate": scheduler.get_last_lr()[0],
             **_policy_accuracy_metrics(policy_accuracy_stats),
         }
         if validation_loader is not None:
@@ -432,26 +542,17 @@ def train_supervised(
                 policy_loss,
                 value_loss,
                 use_amp,
+                amp_dtype=amp_dtype,
                 max_steps=max_steps,
                 desc=f"validation {epoch + 1}/{epochs}",
             )
             epoch_metrics.update(_prefix_metrics("val", validation_metrics))
         history.append(epoch_metrics)
+        save_checkpoint(out_path)
+        if epoch_metrics.get("val_loss", math.inf) < best_val_loss:
+            best_val_loss = epoch_metrics["val_loss"]
+            save_checkpoint(best_path)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": checkpoint_model.state_dict(),
-            "model_config": asdict(model_config),
-            "policy_size": POLICY_SIZE,
-            "policy_square_order": POLICY_SQUARE_ORDER,
-            "history": history,
-            "validation_fraction": validation_fraction,
-            "validation_shards": [shard.name for shard in validation_shards],
-        },
-        out_path,
-    )
-    (out_path.with_suffix(out_path.suffix + ".json")).write_text(json.dumps({"history": history}, indent=2), encoding="utf-8")
     return history
 
 
@@ -464,27 +565,40 @@ def evaluate_supervised(
     device_name: str | None = None,
     amp: bool = True,
     max_steps: int | None = None,
+    allow_legacy_policy: bool = False,
 ) -> dict[str, float]:
-    model, _ = load_model_checkpoint(checkpoint_path, device_name=device_name)
+    model, _ = load_model_checkpoint(
+        checkpoint_path,
+        device_name=device_name,
+        allow_legacy_policy=allow_legacy_policy,
+    )
     device = next(model.parameters()).device
     shards = sorted(data_dir.glob("shard-*.npz"))
     loader = _make_batch_loader(data_dir, batch_size, shards, num_workers, device, shuffle=False)
     policy_loss = nn.CrossEntropyLoss()
     value_loss = nn.MSELoss()
     use_amp = amp and device.type == "cuda"
-    return _evaluate_model(model, loader, device, policy_loss, value_loss, use_amp, max_steps=max_steps)
+    return _evaluate_model(
+        model, loader, device, policy_loss, value_loss, use_amp, amp_dtype=_amp_dtype(device), max_steps=max_steps
+    )
 
 
-def load_model_checkpoint(checkpoint_path: Path, device_name: str | None = None) -> tuple[ChessCNNTransformer, ModelConfig]:
+def load_model_checkpoint(
+    checkpoint_path: Path,
+    device_name: str | None = None,
+    *,
+    allow_legacy_policy: bool = False,
+) -> tuple[ChessCNNTransformer, ModelConfig]:
     device = _resolve_device(device_name)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if checkpoint.get("policy_square_order") != POLICY_SQUARE_ORDER:
-        warnings.warn(
-            "checkpoint was saved without the current policy square-order metadata; "
-            "retrain it before using search or the GUI",
-            RuntimeWarning,
-            stacklevel=2,
+        message = (
+            "checkpoint policy square-order metadata is missing or incompatible; "
+            "retrain it before using search, evaluate, or the GUI"
         )
+        if not allow_legacy_policy:
+            raise RuntimeError(f"{message}. Pass allow_legacy_policy=True only for deliberate legacy inspection.")
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
     config = ModelConfig(**checkpoint["model_config"])
     model = ChessCNNTransformer(config).to(device)
     model.load_state_dict(checkpoint["model"])
@@ -617,6 +731,7 @@ def _evaluate_distillation(
     value_weight: float,
     use_amp: bool,
     *,
+    amp_dtype: torch.dtype = torch.float16,
     max_steps: int | None = None,
     desc: str = "evaluate",
 ) -> dict[str, float]:
@@ -636,7 +751,7 @@ def _evaluate_distillation(
             policy_indices = policy_indices.to(device, non_blocking=True)
             policy_probs = policy_probs.to(device, non_blocking=True)
 
-            with torch.autocast(device_type=device.type, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 outputs = model(boards)
                 loss_policy, loss_value = _distillation_losses(outputs, wdl, policy_indices, policy_probs)
                 loss = loss_policy + value_weight * loss_value
@@ -653,6 +768,8 @@ def _evaluate_distillation(
 
     if was_training:
         model.train()
+
+    _require_steps(steps, desc)
 
     return {
         "loss": total_loss / steps,
@@ -681,6 +798,7 @@ def train_distillation(
     validation_seed: int = 0,
 ) -> list[dict[str, float]]:
     device = _resolve_device(device_name)
+    _configure_backend(device)
     train_shards, validation_shards = _split_train_validation_shards(data_dir, validation_fraction, validation_seed)
     loader = _make_eval_batch_loader(data_dir, batch_size, train_shards, num_workers, device, shuffle=True)
     validation_loader = (
@@ -695,14 +813,38 @@ def train_distillation(
     if compile_model and hasattr(torch, "compile"):
         model = torch.compile(model)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        _optimizer_param_groups(checkpoint_model, weight_decay),
         lr=learning_rate,
-        weight_decay=weight_decay,
         fused=device.type == "cuda",
     )
+    scheduler = _make_lr_scheduler(optimizer, _total_training_steps(loader, epochs, max_steps))
     use_amp = amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = _amp_dtype(device)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
     history: list[dict[str, float]] = []
+    best_val_loss = math.inf
+    best_path = out_path.with_name(f"{out_path.stem}-best{out_path.suffix}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def save_checkpoint(path: Path) -> None:
+        torch.save(
+            {
+                "model": checkpoint_model.state_dict(),
+                "model_config": asdict(model_config),
+                "policy_size": POLICY_SIZE,
+                "policy_square_order": POLICY_SQUARE_ORDER,
+                "data_format": "evals",
+                "value_weight": value_weight,
+                "history": history,
+                "epochs_completed": len(history),
+                "validation_fraction": validation_fraction,
+                "validation_shards": [shard.name for shard in validation_shards],
+            },
+            path,
+        )
+        path.with_suffix(path.suffix + ".json").write_text(
+            json.dumps({"history": history}, indent=2), encoding="utf-8"
+        )
 
     for epoch in range(epochs):
         model.train()
@@ -719,7 +861,7 @@ def train_distillation(
             policy_probs = policy_probs.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, enabled=use_amp):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 outputs = model(boards)
                 loss_policy, loss_value = _distillation_losses(outputs, wdl, policy_indices, policy_probs)
                 loss = loss_policy + value_weight * loss_value
@@ -729,6 +871,7 @@ def train_distillation(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
 
             steps += 1
             total_loss += float(loss.detach())
@@ -740,10 +883,12 @@ def train_distillation(
             if max_steps is not None and steps >= max_steps:
                 break
 
+        _require_steps(steps, f"epoch {epoch + 1}/{epochs}")
         epoch_metrics = {
             "loss": total_loss / steps,
             "policy_loss": total_policy / steps,
             "value_loss": total_value / steps,
+            "learning_rate": scheduler.get_last_lr()[0],
             **_distillation_accuracy_metrics(stats),
         }
         if validation_loader is not None:
@@ -753,28 +898,17 @@ def train_distillation(
                 device,
                 value_weight,
                 use_amp,
+                amp_dtype=amp_dtype,
                 max_steps=max_steps,
                 desc=f"validation {epoch + 1}/{epochs}",
             )
             epoch_metrics.update(_prefix_metrics("val", validation_metrics))
         history.append(epoch_metrics)
+        save_checkpoint(out_path)
+        if epoch_metrics.get("val_loss", math.inf) < best_val_loss:
+            best_val_loss = epoch_metrics["val_loss"]
+            save_checkpoint(best_path)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": checkpoint_model.state_dict(),
-            "model_config": asdict(model_config),
-            "policy_size": POLICY_SIZE,
-            "policy_square_order": POLICY_SQUARE_ORDER,
-            "data_format": "evals",
-            "value_weight": value_weight,
-            "history": history,
-            "validation_fraction": validation_fraction,
-            "validation_shards": [shard.name for shard in validation_shards],
-        },
-        out_path,
-    )
-    (out_path.with_suffix(out_path.suffix + ".json")).write_text(json.dumps({"history": history}, indent=2), encoding="utf-8")
     return history
 
 
@@ -788,10 +922,17 @@ def evaluate_distillation(
     device_name: str | None = None,
     amp: bool = True,
     max_steps: int | None = None,
+    allow_legacy_policy: bool = False,
 ) -> dict[str, float]:
-    model, _ = load_model_checkpoint(checkpoint_path, device_name=device_name)
+    model, _ = load_model_checkpoint(
+        checkpoint_path,
+        device_name=device_name,
+        allow_legacy_policy=allow_legacy_policy,
+    )
     device = next(model.parameters()).device
     shards = sorted(data_dir.glob("shard-*.npz"))
     loader = _make_eval_batch_loader(data_dir, batch_size, shards, num_workers, device, shuffle=False)
     use_amp = amp and device.type == "cuda"
-    return _evaluate_distillation(model, loader, device, value_weight, use_amp, max_steps=max_steps)
+    return _evaluate_distillation(
+        model, loader, device, value_weight, use_amp, amp_dtype=_amp_dtype(device), max_steps=max_steps
+    )

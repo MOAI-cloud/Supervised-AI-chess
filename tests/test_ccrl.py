@@ -4,7 +4,7 @@ import chess
 import numpy as np
 
 from superchess.ccrl import EngineRating, high_elo_archives, parse_engine_archives, parse_rating_list, preprocess_pgn_files
-from superchess.encoding import move_to_policy
+from superchess.encoding import move_to_policy, pack_board
 
 
 def test_parse_rating_list_extracts_engine_elos():
@@ -111,7 +111,7 @@ def test_preprocess_filters_ccrl_games_and_writes_policy_samples(tmp_path: Path)
     assert stats.games_skipped_rating == 1
     assert stats.samples == 4
     shard = np.load(tmp_path / "processed" / "shard-00000.npz")
-    assert shard["boards"].shape == (4, 144)
+    assert shard["boards"].shape == (4, pack_board(chess.Board()).shape[0])
     assert shard["policies"][0] == move_to_policy(chess.Board(), chess.Move.from_uci("e2e4")).index
     assert shard["values"].tolist() == [1.0, -1.0, 1.0, -1.0]
 
