@@ -8,7 +8,6 @@ the neural MCTS engine. Serves a polished single-page frontend from ``web/``.
 from __future__ import annotations
 
 import json
-import math
 import threading
 import time
 import webbrowser
@@ -23,12 +22,10 @@ import chess.svg as chess_svg
 
 from superchess.openings import OPENING_BOOK, OpeningInfo, ensure_opening_database
 from superchess.stockfish import StockfishHandle, StockfishPlayResult, StockfishUnavailableError
+from superchess.targets import DEFAULT_CP_SCALE, value_to_cp as _value_to_cp
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 
-# Lc0-style mapping from a [-1, 1] value head to centipawns.
-_CP_SCALE = 111.714640912
-_CP_SLOPE = 1.5620688421
 _MAX_GUI_SIMULATIONS = 65_536
 _MAX_PV_LENGTH = 128
 
@@ -313,12 +310,16 @@ _OPENINGS: dict[str, str] = {
 }
 
 
-def value_to_cp(value: float) -> int:
-    """Convert a side-to-move value in [-1, 1] to an integer centipawn score."""
+def value_to_cp(value: float, cp_scale: float = DEFAULT_CP_SCALE) -> int:
+    """Convert a side-to-move value in [-1, 1] to integer centipawns.
+
+    This inverts the training target mapping (``value = 2 * sigmoid(cp / cp_scale) - 1``),
+    so displayed centipawns are on the same scale as the Stockfish evaluations the
+    network was distilled from.
+    """
 
     value = max(-0.9999, min(0.9999, float(value)))
-    cp = _CP_SCALE * math.tan(_CP_SLOPE * value)
-    return int(max(-12000, min(12000, round(cp))))
+    return int(max(-12000, min(12000, _value_to_cp(value, cp_scale))))
 
 
 def _superchess_evaluation(engine: "EngineHandle", board: chess.Board) -> dict[str, Any]:
@@ -343,10 +344,14 @@ def _superchess_evaluation(engine: "EngineHandle", board: chess.Board) -> dict[s
     white_value = value if board.turn == chess.WHITE else -value
     return {
         "value": value,
-        "cp_white": value_to_cp(white_value),
+        "cp_white": value_to_cp(white_value, _engine_cp_scale(engine)),
         "mate_white": None,
         "source": "superchess",
     }
+
+
+def _engine_cp_scale(engine: Any) -> float:
+    return float(getattr(engine, "cp_scale", DEFAULT_CP_SCALE) or DEFAULT_CP_SCALE)
 
 
 def detect_opening(board: chess.Board) -> OpeningInfo | None:
@@ -397,6 +402,7 @@ class EngineHandle:
     checkpoint: Path
     device: str | None = None
     allow_legacy_checkpoint: bool = False
+    cp_scale: float = DEFAULT_CP_SCALE
     _model: Any = None
     _lock: threading.Lock = None  # type: ignore[assignment]
     _search_lock: threading.Lock = None  # type: ignore[assignment]
@@ -412,14 +418,15 @@ class EngineHandle:
         if self._model is None:
             with self._lock:
                 if self._model is None:
-                    from superchess.training import load_model_checkpoint
+                    from superchess.training import load_checkpoint_bundle
 
-                    model, _ = load_model_checkpoint(
+                    bundle = load_checkpoint_bundle(
                         self.checkpoint,
                         device_name=self.device,
                         allow_legacy_policy=self.allow_legacy_checkpoint,
                     )
-                    self._model = model
+                    self.cp_scale = bundle.target_config.cp_scale
+                    self._model = bundle.model
         return self._model
 
     def search(
@@ -576,6 +583,7 @@ def build_analysis(
     )
 
     root = result.root
+    cp_scale = _engine_cp_scale(engine)
     lines: list[dict[str, Any]] = []
     for move, visits in ranked[: max(1, multipv)]:
         index = root.move_index(move) if root is not None else -1
@@ -583,7 +591,7 @@ def build_analysis(
         # Edge Q-values are already stored from the root player's perspective.
         cp = None
         if index >= 0 and root.child_visits(index) > 0:
-            cp = value_to_cp(root.child_q(index))
+            cp = value_to_cp(root.child_q(index), cp_scale)
         pv_moves = [move]
         if child is not None:
             after = board.copy(stack=False)
@@ -591,7 +599,7 @@ def build_analysis(
             pv_moves += searcher.principal_variation(child, after, max_len=pv_length - 1)
         info = _line_from_pv(board, pv_moves)
         if cp is None:
-            cp = value_to_cp(0.0)
+            cp = value_to_cp(0.0, cp_scale)
         lines.append(
             {
                 "cp": cp,
@@ -1031,7 +1039,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(
             {
                 **evaluation,
-                "cp": value_to_cp(evaluation["value"]),
+                "cp": value_to_cp(evaluation["value"], _engine_cp_scale(self.engine)),
                 "turn": "white" if board.turn == chess.WHITE else "black",
             }
         )

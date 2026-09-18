@@ -28,7 +28,7 @@ def test_cli_search_passes_legacy_and_batch_options(monkeypatch, tmp_path, capsy
 
         def search(self, board):
             move = chess.Move.from_uci("e2e4")
-            return SimpleNamespace(best_move=move, visits={move: 3}, policy={move: 1.0})
+            return SimpleNamespace(best_move=move, visits={move: 3}, policy={move: 1.0}, stats=mcts.SearchStats(simulations=3))
 
     monkeypatch.setattr(training, "load_model_checkpoint", fake_load_model_checkpoint)
     monkeypatch.setattr(mcts, "NeuralMCTS", FakeMCTS)
@@ -43,6 +43,10 @@ def test_cli_search_passes_legacy_and_batch_options(monkeypatch, tmp_path, capsy
             "4",
             "--device",
             "cpu",
+            "--root-selection",
+            "sequential_halving",
+            "--root-candidates",
+            "8",
         ]
     )
 
@@ -52,6 +56,9 @@ def test_cli_search_passes_legacy_and_batch_options(monkeypatch, tmp_path, capsy
     assert called["allow_legacy_policy"] is True
     assert called["device"] == "cpu"
     assert called["config"].evaluation_batch_size == 4
+    assert called["config"].root_selection == "sequential_halving"
+    assert called["config"].root_candidates == 8
+    assert payload["stats"]["simulations"] == 3
 
 
 def test_cli_gui_passes_stockfish_path(monkeypatch, tmp_path):

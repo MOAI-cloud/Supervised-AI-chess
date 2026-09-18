@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import time
 from typing import Hashable
 
 import chess
@@ -24,6 +25,22 @@ class SearchConfig:
     fpu_reduction: float = 0.3
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.0
+    policy_softmax_temperature: float = 1.0
+    """Divides the network's policy logits before the legal-move softmax (>1 flattens the prior)."""
+    root_selection: str = "puct"
+    root_candidates: int = 16
+    root_value_scale: float = 0.1
+    root_rescue_margin: float = 0.15
+
+    def __post_init__(self) -> None:
+        if self.root_selection not in {"puct", "sequential_halving", "value_rescue"}:
+            raise ValueError("root_selection must be 'puct', 'sequential_halving', or 'value_rescue'")
+        if self.root_candidates < 1:
+            raise ValueError("root_candidates must be positive")
+        if not math.isfinite(self.root_value_scale) or self.root_value_scale < 0:
+            raise ValueError("root_value_scale must be finite and nonnegative")
+        if not math.isfinite(self.root_rescue_margin) or self.root_rescue_margin < 0:
+            raise ValueError("root_rescue_margin must be finite and nonnegative")
 
 
 class MCTSNode:
@@ -35,13 +52,15 @@ class MCTSNode:
     negation or attribute chasing.
     """
 
-    __slots__ = ("moves", "priors", "visit_counts", "value_sums", "children", "terminal_value")
+    __slots__ = ("moves", "priors", "visit_counts", "value_sums", "children", "terminal_value", "network_value")
 
     def __init__(
         self,
         moves: list[chess.Move],
         priors: np.ndarray,
         terminal_value: float | None = None,
+        *,
+        network_value: float = 0.0,
     ) -> None:
         count = len(moves)
         self.moves = moves
@@ -50,6 +69,7 @@ class MCTSNode:
         self.value_sums = np.zeros(count, dtype=np.float32)
         self.children: list[MCTSNode | None] = [None] * count
         self.terminal_value = terminal_value
+        self.network_value = network_value
 
     @classmethod
     def terminal(cls, value: float) -> "MCTSNode":
@@ -75,11 +95,93 @@ class MCTSNode:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchStats:
+    simulations: int = 0
+    network_evaluations: int = 0
+    network_batches: int = 0
+    cache_hits: int = 0
+    batch_collisions: int = 0
+    terminal_evaluations: int = 0
+    max_depth: int = 0
+    elapsed_seconds: float = 0.0
+    root_rescues: int = 0
+    root_rescue_selected: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class SearchResult:
     best_move: chess.Move
     visits: dict[chess.Move, int]
     policy: dict[chess.Move, float]
     root: "MCTSNode | None" = None
+    stats: SearchStats | None = None
+
+
+class _RootHalving:
+    """Budgeted, deterministic root halving with PUCT below the root.
+
+    Ranking uses log(prior) + 0.1 * (50 + max_new_visits) * Q by default.
+    Unlike Full Gumbel MuZero, values are not min-max rescaled, no Gumbel noise
+    is added, and interior selection is unchanged. A round must be fully
+    backed up before its candidates can be eliminated.
+    """
+
+    def __init__(self, root: MCTSNode, budget: int, config: SearchConfig) -> None:
+        self.root = root
+        self.value_scale = config.root_value_scale
+        self.initial_counts = root.visit_counts.copy()
+        self.round_counts = root.visit_counts.copy()
+        count = min(config.root_candidates, len(root.moves), max(1, budget))
+        self.candidates = np.argsort(-root.priors, kind="stable")[:count]
+        self.log_priors = np.log(np.maximum(root.priors.astype(np.float64), 1e-30))
+        self.remaining = 0
+        self.started = False
+        self.rescue_enabled = config.root_selection == "value_rescue"
+        self.rescue_margin = config.root_rescue_margin
+        self.max_candidates = config.root_candidates
+        self.considered = np.zeros(len(root.moves), dtype=bool)
+        self.considered[self.candidates] = True
+        self.rescued = 0
+        self.rescue_indices: set[int] = set()
+
+    def scores(self) -> np.ndarray:
+        q_values = np.zeros_like(self.root.value_sums)
+        np.divide(self.root.value_sums, self.root.visit_counts, out=q_values, where=self.root.visit_counts > 0)
+        max_visits = float((self.root.visit_counts - self.initial_counts).max())
+        return self.log_priors + self.value_scale * (50.0 + max_visits) * q_values
+
+    def begin_round(self, budget: int) -> None:
+        probe_tail = self.rescue_enabled and not self.started and not self.considered.all()
+        if self.started:
+            best_value = max(self.root.child_q(int(index)) for index in self.candidates)
+            ranking = np.argsort(-self.scores()[self.candidates], kind="stable")
+            self.candidates = self.candidates[ranking[: (len(self.candidates) + 1) // 2]]
+            if self.rescue_enabled and best_value < self.root.network_value - self.rescue_margin:
+                tail = np.flatnonzero(~self.considered)
+                slots = min(len(self.candidates), self.max_candidates - len(self.candidates), budget - len(self.candidates))
+                if len(tail) and slots > 0:
+                    order = np.argsort(-self.root.priors[tail], kind="stable")
+                    challengers = tail[order[:slots]]
+                    self.candidates = np.concatenate((self.candidates, challengers))
+                    self.considered[challengers] = True
+                    self.rescued += len(challengers)
+                    self.rescue_indices.update(int(index) for index in challengers)
+                    probe_tail = True
+        self.started = True
+        count = len(self.candidates)
+        rounds = max(1, (count - 1).bit_length())
+        quota = 1 if probe_tail else max(1, budget // (count * rounds))
+        self.remaining = min(budget, count * quota)
+        self.round_counts = self.root.visit_counts.copy()
+
+    def select_index(self) -> int:
+        counts = (self.root.visit_counts - self.round_counts)[self.candidates]
+        return int(self.candidates[int(np.argmin(counts))])
+
+    def policy(self, temperature: float) -> dict[chess.Move, float]:
+        logits = np.full(len(self.root.moves), -np.inf, dtype=np.float64)
+        logits[self.candidates] = self.scores()[self.candidates]
+        return _logit_policy(self.root.moves, logits, temperature)
 
 
 class NeuralMCTS:
@@ -95,7 +197,8 @@ class NeuralMCTS:
         self.device = torch.device(device or next(model.parameters()).device)
         self.model = model.to(self.device).eval()
         self.config = config
-        self.input_channels = getattr(getattr(model, "config", None), "input_channels", 18)
+        self.input_channels = getattr(getattr(model, "config", None), "input_channels", LEGACY_BOARD_CHANNELS)
+        self._policy_temperature = max(1e-3, float(config.policy_softmax_temperature))
         self._amp_enabled = self.device.type == "cuda"
         self._amp_dtype = (
             torch.bfloat16 if self._amp_enabled and torch.cuda.is_bf16_supported() else torch.float16
@@ -108,6 +211,9 @@ class NeuralMCTS:
         # extended planes, so only key on them when they matter.
         self._clock_sensitive = self.input_channels > LEGACY_BOARD_CHANNELS
         self._rng = np.random.default_rng()
+        self._network_evaluations = 0
+        self._network_batches = 0
+        self._cache_hits = 0
 
     @torch.inference_mode()
     def evaluate(self, board: chess.Board) -> tuple[dict[chess.Move, float], float]:
@@ -150,6 +256,7 @@ class NeuralMCTS:
             cached = self._eval_cache.get(key)
             if cached is not None:
                 results[index] = cached
+                self._cache_hits += 1
                 continue
             slots = key_slots.setdefault(key, [])
             if not slots:
@@ -158,6 +265,8 @@ class NeuralMCTS:
             slots.append(index)
         if fresh_indices:
             evaluations = self._run_model([boards[index] for index in fresh_indices])
+            self._network_evaluations += len(fresh_indices)
+            self._network_batches += 1
             for key, evaluation in zip(fresh_keys, evaluations, strict=True):
                 self._cache_store(key, evaluation)
                 for slot in key_slots[key]:
@@ -182,6 +291,8 @@ class NeuralMCTS:
             moves = list(legal.keys())
             indices = np.fromiter(legal.values(), dtype=np.int64, count=len(moves))
             masked = logits[indices].astype(np.float32, copy=False)
+            if self._policy_temperature != 1.0:
+                masked /= self._policy_temperature
             masked -= masked.max()
             np.exp(masked, out=masked)
             masked /= masked.sum()
@@ -201,35 +312,63 @@ class NeuralMCTS:
         position** (see :func:`find_subtree`); its statistics are reused so
         earlier work carries over.
         """
+        started = time.perf_counter()
+        initial_evaluations = self._network_evaluations
+        initial_batches = self._network_batches
+        initial_hits = self._cache_hits
         if board.is_game_over(claim_draw=True):
             raise ValueError("cannot search a finished game")
 
         root: MCTSNode | None = tree if tree is not None and tree.terminal_value is None and tree.moves else None
         if root is None:
-            ((moves, priors, _),) = self._evaluate_positions([board])
+            ((moves, priors, value),) = self._evaluate_positions([board])
             if not moves:
                 raise ValueError("no legal moves available")
-            root = MCTSNode(moves, priors.copy())
+            root = MCTSNode(moves, priors.copy(), network_value=value)
         if self.config.dirichlet_epsilon > 0.0:
             self._apply_root_noise(root)
 
         history_counts = _history_key_counts(board)
         simulations = max(0, self.config.simulations)
         batch_size = max(1, self.config.evaluation_batch_size)
+        halving = _RootHalving(root, simulations, self.config) if self.config.root_selection != "puct" else None
         completed = 0
+        collisions = terminal_evaluations = max_depth = 0
         while completed < simulations:
+            if halving is not None and halving.remaining == 0:
+                halving.begin_round(simulations - completed)
             batch_limit = min(batch_size, simulations - completed)
+            if halving is not None:
+                batch_limit = min(batch_limit, halving.remaining)
             pending: list[tuple[MCTSNode, int, list[tuple[MCTSNode, int]], chess.Board]] = []
+            pending_edges: set[tuple[MCTSNode, int]] = set()
 
             for _ in range(batch_limit):
-                parent, index, path, leaf_board, terminal = self._descend(root, board, history_counts)
+                root_index = halving.select_index() if halving is not None else None
+                parent, index, path, leaf_board, terminal = self._descend(root, board, history_counts, root_index=root_index)
+                max_depth = max(max_depth, len(path))
                 if terminal is not None:
                     _backup(path, terminal)
+                    terminal_evaluations += 1
                 else:
+                    edge = (parent, index)
+                    if edge in pending_edges:
+                        _cancel_virtual_loss(path)
+                        collisions += 1
+                        break
+                    pending_edges.add(edge)
                     pending.append((parent, index, path, leaf_board))
+                completed += 1
+                if halving is not None:
+                    halving.remaining -= 1
 
             if pending:
-                evaluations = self._evaluate_positions([leaf_board for *_, leaf_board in pending])
+                try:
+                    evaluations = self._evaluate_positions([leaf_board for *_, leaf_board in pending])
+                except BaseException:
+                    for _, _, path, _ in pending:
+                        _cancel_virtual_loss(path)
+                    raise
                 for (parent, index, path, leaf_board), (moves, priors, value) in zip(
                     pending, evaluations, strict=True
                 ):
@@ -238,25 +377,43 @@ class NeuralMCTS:
                     elif leaf_board.halfmove_clock >= 100:  # in-check fifty-move edge case
                         child = MCTSNode.terminal(0.0)
                     else:
-                        child = MCTSNode(moves, priors.copy())
+                        child = MCTSNode(moves, priors.copy(), network_value=value)
                     parent.children[index] = child
                     _backup(path, value if child.terminal_value is None else child.terminal_value)
-
-            completed += batch_limit
+                    terminal_evaluations += int(child.terminal_value is not None)
 
         visits = {
             move: int(count)
             for move, count in zip(root.moves, root.visit_counts.tolist(), strict=True)
         }
-        policy = visit_policy(visits, self.config.temperature)
+        if not any(visits.values()):
+            policy = _logit_policy(root.moves, np.log(np.maximum(root.priors, 1e-30)), self.config.temperature)
+        elif halving is not None and simulations > 0:
+            policy = halving.policy(self.config.temperature)
+        else:
+            policy = visit_policy(visits, self.config.temperature)
         best_move = max(policy, key=policy.get)
-        return SearchResult(best_move=best_move, visits=visits, policy=policy, root=root)
+        stats = SearchStats(
+            simulations=completed,
+            network_evaluations=self._network_evaluations - initial_evaluations,
+            network_batches=self._network_batches - initial_batches,
+            cache_hits=self._cache_hits - initial_hits,
+            batch_collisions=collisions,
+            terminal_evaluations=terminal_evaluations,
+            max_depth=max_depth,
+            elapsed_seconds=time.perf_counter() - started,
+            root_rescues=halving.rescued if halving is not None else 0,
+            root_rescue_selected=int(halving is not None and root.move_index(best_move) in halving.rescue_indices),
+        )
+        return SearchResult(best_move=best_move, visits=visits, policy=policy, root=root, stats=stats)
 
     def _descend(
         self,
         root: MCTSNode,
         board: chess.Board,
         history_counts: dict[Hashable, int],
+        *,
+        root_index: int | None = None,
     ) -> tuple[MCTSNode, int, list[tuple[MCTSNode, int]], chess.Board, float | None]:
         """Walk one simulation to a leaf, applying virtual loss along the way.
 
@@ -274,7 +431,7 @@ class NeuralMCTS:
         path_keys: set[Hashable] = set()
 
         while True:
-            index = _select_index(node, c_puct, fpu_reduction)
+            index = root_index if not path and root_index is not None else _select_index(node, c_puct, fpu_reduction)
             node.visit_counts[index] += 1.0
             node.value_sums[index] -= 1.0  # virtual loss: looks lost until backed up
             path.append((node, index))
@@ -351,6 +508,13 @@ def _backup(path: list[tuple[MCTSNode, int]], value: float) -> None:
         node.value_sums[index] += value + 1.0  # +1 reverts the virtual loss
 
 
+def _cancel_virtual_loss(path: list[tuple[MCTSNode, int]]) -> None:
+    """Release an unfinished simulation without changing completed statistics."""
+    for node, index in reversed(path):
+        node.visit_counts[index] -= 1.0
+        node.value_sums[index] += 1.0
+
+
 def _history_key_counts(board: chess.Board) -> dict[Hashable, int]:
     """Occurrence counts of every position in the game history (root included)."""
     counts: dict[Hashable, int] = {}
@@ -409,3 +573,12 @@ def visit_policy(visits: dict[chess.Move, int], temperature: float) -> dict[ches
         return {move: 1.0 / len(moves) for move in moves}
     probs = counts / total
     return dict(zip(moves, probs.tolist(), strict=True))
+
+
+def _logit_policy(moves: list[chess.Move], logits: np.ndarray, temperature: float) -> dict[chess.Move, float]:
+    if temperature <= 0:
+        best = int(np.argmax(logits))
+        return {move: float(index == best) for index, move in enumerate(moves)}
+    weights = np.exp((logits - logits.max()) / max(temperature, 1e-8))
+    weights /= weights.sum()
+    return dict(zip(moves, weights.tolist(), strict=True))
